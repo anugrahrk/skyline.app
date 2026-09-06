@@ -1,0 +1,119 @@
+name: Peekaboo iOS Build
+# Note: If the repo has existing GitHub Actions workflows,
+# those will also run independently. Only the Peekaboo
+# workflow uploads to your preview.
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Peekaboo build ID'
+        required: true
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment variables
+        run: |
+          env | grep "^PEEKABOO_ENV_" | while IFS='=' read -r key value; do
+            clean_key="${key#PEEKABOO_ENV_}"
+            echo "$clean_key=$value" >> $GITHUB_ENV
+            echo "$clean_key=$value" >> .env
+            echo "$clean_key=$value" >> .env.local
+            echo "$clean_key=$value" >> .env.production
+            echo "$clean_key=$value" >> .env.development
+          done
+          echo "✓ Environment variables configured"
+        working-directory: .
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+        working-directory: .
+
+      - name: Generate localizations (if needed)
+        run: |
+          if [ -f "l10n.yaml" ] || grep -r "generate: true" lib/ 2>/dev/null; then
+            flutter gen-l10n
+          else
+            echo "No localization generation needed"
+          fi
+        working-directory: .
+
+      - name: Build for simulator
+        run: |
+          flutter build ios \
+            --simulator \
+            --no-codesign \
+            --debug
+        working-directory: .
+
+      - name: Find and zip .app
+        run: |
+          # Flutter outputs to build/ios/iphonesimulator/
+          APP=$(find ./build/ios -name "*.app" \
+            -not -name "*.appex" \
+            -not -path "*/\.*" \
+            | head -1)
+
+          # Fallback — search entire build dir
+          if [ -z "$APP" ]; then
+            APP=$(find ./build -name "*.app" \
+              -not -name "*.appex" \
+              -not -path "*/\.*" \
+              | head -1)
+          fi
+
+          if [ -z "$APP" ]; then
+            echo "ERROR: No .app found. Build directory:"
+            find ./build -type d | head -30
+            exit 1
+          fi
+
+          echo "Found: $APP"
+          zip -r app.zip "$APP"
+        working-directory: .
+
+      - name: Get signed upload URL
+        run: |
+          RESPONSE=$(curl -s -X POST ${{ secrets.PEEKABOO_WEBHOOK_URL }}/upload-url \
+            -H "x-peekaboo-secret: ${{ secrets.PEEKABOO_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"build_id":"${{ github.event.inputs.build_id }}"}')
+          echo "SIGNED_URL=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['signedUrl'])")" >> $GITHUB_ENV
+        working-directory: .
+
+      - name: Upload app.zip to Supabase Storage
+        run: |
+          curl -X PUT "$SIGNED_URL" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @app.zip
+        working-directory: .
+
+      - name: Notify Peekaboo webhook
+        run: |
+          curl -X POST ${{ secrets.PEEKABOO_WEBHOOK_URL }} \
+            -H "x-peekaboo-secret: ${{ secrets.PEEKABOO_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"build_id":"${{ github.event.inputs.build_id }}"}'
+        working-directory: .
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -X POST ${{ secrets.PEEKABOO_WEBHOOK_URL }} \
+            -H "x-peekaboo-secret: ${{ secrets.PEEKABOO_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "build_id": "${{ github.event.inputs.build_id }}",
+              "status": "failed",
+              "error": "Build failed. Check GitHub Actions for details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }'
+        working-directory: .
